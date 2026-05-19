@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+venv/
+.env/
+go2_legacy_env/
+
+# Logs
+*.log
+logs/
+
+# Runtime dumps
+*.json
+*.dump
+
+# ROS2
+build/
+install/
+log/
+
+# VSCode
+.vscode/
+
+# Secrets
+*.key
+*.pem
+.envrc
+
+# OS
+.DS_Store
+Thumbs.db
