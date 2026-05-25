@@ -7,6 +7,8 @@ Single WebRTC session — LiDAR + Odometry + Teleop over one connection.
 ---
 
 ## Architecture
+
+```
 HOST
 ┌─────────────────────────────────────────────┐
 │  go2_master.py                              │
@@ -27,6 +29,7 @@ DOCKER (go2_ros2)
 ├── lidar_ros_publisher.py   UDP 5005 → /scan
 ├── odom_ros_publisher.py    UDP 5006 → /odom + TF
 └── static_transform_publisher  base_link → laser
+```
 
 ---
 
