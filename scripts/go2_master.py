@@ -46,6 +46,7 @@ SPORT_MOD_PUBLISH_HZ = 20
 SPORT_MOD_INTERVAL   = 1.0 / SPORT_MOD_PUBLISH_HZ
 
 CMD_QUEUE_MAXSIZE = 20
+CMD_FRESHNESS_TIMEOUT_S = 0.5  # stale cmd → StopMove
 
 _ZERO_CMD = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
 _stop_immediate = False
@@ -236,10 +237,11 @@ class ConnectionMonitor:
         if odom_timeout:
             log("MONITOR", f"odom_timeout   elapsed={odom_elapsed:.1f}s")
 
-        if scan_delta > 0:
-            log("LIDAR", f"seq={state.scan_seq}  hz_est={scan_delta / MONITOR_INTERVAL_S:.1f}")
-        if odom_delta > 0:
-            log("ODOM",  f"seq={state.odom_seq}  hz_est={odom_delta / MONITOR_INTERVAL_S:.1f}")
+        # Logs periodicos LIDAR/ODOM silenciados para prueba de locomocion
+        # if scan_delta > 0:
+        #     log("LIDAR", f"seq={state.scan_seq}  hz_est={scan_delta / MONITOR_INTERVAL_S:.1f}")
+        # if odom_delta > 0:
+        #     log("ODOM",  f"seq={state.odom_seq}  hz_est={odom_delta / MONITOR_INTERVAL_S:.1f}")
 
         if state.connection_state == LifecycleState.CONNECTED:
             if lidar_timeout or odom_timeout:
@@ -343,7 +345,7 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
     log("SPORT", "publish_loop started  hz=20  mode=continuous")
     last_cmd = _ZERO_CMD.copy()
     was_moving = False
-
+    last_cmd_ts = time.monotonic()  # freshness — master es dueño del clock
     try:
         while state.connection_state not in (LifecycleState.SHUTDOWN,):
             global _stop_immediate
@@ -355,32 +357,46 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
                         {"api_id": SPORT_CMD["StopMove"]},
                     )
                     last_cmd = _ZERO_CMD.copy()
+                    last_cmd_ts = time.monotonic()
                     was_moving = False
                 except Exception as e:
                     log_error_rate_limited("sport_stop_imm", str(e))
                 await asyncio.sleep(0)
                 continue
             await asyncio.sleep(SPORT_MOD_INTERVAL)
-
             while not cmd_queue.empty():
                 try:
                     last_cmd = cmd_queue.get_nowait()
+                    last_cmd_ts = time.monotonic()  # cmd fresco — actualizar timestamp
                 except asyncio.QueueEmpty:
                     break
-
             moving = not (last_cmd["vx"] == 0.0 and last_cmd["vy"] == 0.0 and last_cmd["wz"] == 0.0)
-
+            # Freshness watchdog — master es dueño del clock
+            if moving and (time.monotonic() - last_cmd_ts) > CMD_FRESHNESS_TIMEOUT_S:
+                if was_moving:
+                    try:
+                        elapsed = time.monotonic() - last_cmd_ts
+                        await conn.datachannel.pub_sub.publish_request_new(
+                            RTC_TOPIC["SPORT_MOD"],
+                            {"api_id": SPORT_CMD["StopMove"]},
+                        )
+                        log("SPORT", f"freshness_timeout elapsed={elapsed:.2f}s — StopMove enviado")
+                    except Exception as e:
+                        log_error_rate_limited("sport_fresh_stop", str(e))
+                last_cmd = _ZERO_CMD.copy()
+                was_moving = False
+                continue
             if moving:
                 try:
                     await conn.datachannel.pub_sub.publish_request_new(
                         RTC_TOPIC["SPORT_MOD"],
                         {
                             "api_id": SPORT_CMD["Move"],
-                            "parameter": json.dumps({
+                            "parameter": {
                                 "x": last_cmd["vx"],
                                 "y": last_cmd["vy"],
                                 "z": last_cmd["wz"],
-                            }),
+                            },
                         },
                     )
                 except Exception as e:
@@ -394,7 +410,6 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
                     )
                 except Exception as e:
                     log_error_rate_limited("sport_stop", str(e))
-
             was_moving = moving
     except asyncio.CancelledError:
         pass
