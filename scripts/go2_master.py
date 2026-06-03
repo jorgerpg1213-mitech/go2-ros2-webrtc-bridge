@@ -13,12 +13,32 @@ import numpy as np
 import os
 import signal
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection, WebRTCConnectionMethod
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
+from aiortc import MediaStreamTrack
+
+# Camara opcional: si cv2 no esta o no hay entorno grafico, se desactiva sola
+# sin tumbar el bridge. El video se sigue consumiendo igual (keepalive de sesion).
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except Exception as _cv2_err:
+    _CV2_AVAILABLE = False
+    print("[CAMERA] cv2 no disponible (" + str(_cv2_err) + "); ventana desactivada", flush=True)
+
+# Export de frames a YOLO por memoria compartida (proceso separado). Import
+# protegido: si frame_ipc no esta, el bridge corre igual sin export.
+try:
+    from frame_ipc import FrameWriter
+    _FRAME_IPC_AVAILABLE = True
+except Exception as _ipc_err:
+    _FRAME_IPC_AVAILABLE = False
+    print("[YOLO] frame_ipc no disponible (" + str(_ipc_err) + "); export desactivado", flush=True)
 
 # Fix ICE — crítico si hay ethernet conectado además del robot
 import aioice.ice as _aioice_ice
@@ -28,6 +48,25 @@ _aioice_ice.get_host_addresses = lambda use_ipv4, use_ipv6: [
 ]
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
+
+# Switch de diagnostico. True = reactiva LiDAR/ODOM (necesario para SLAM/RViz).
+# False = no se suscribe a sensores; aisla la locomocion para descartar que el
+# procesamiento de LiDAR este ahogando el event loop. Flipear a True restaura todo.
+ENABLE_SENSORS = True
+
+# Camara: True muestra el streaming en una ventana (como teleop_video2.py).
+# El stream se consume siempre (keepalive); este switch solo controla la ventana.
+ENABLE_CAMERA = True
+
+# Export de frames al proceso de YOLO via memoria compartida.
+# False = master se comporta identico al auditado (esta ruta no se ejecuta).
+# True = en run_display (hilo main) se copia el frame mas reciente a un buzon
+# de memoria compartida que yolo_viewer.py lee desde otro proceso/venv.
+ENABLE_YOLO_EXPORT = False
+
+# Heartbeat de estado en consola cada N segundos (observabilidad/auditoria).
+# Sube el valor para menos ruido; pon 0 para desactivarlo.
+STATUS_INTERVAL_S = 5.0
 
 LIDAR_UDP_HOST = "127.0.0.1"
 LIDAR_UDP_PORT = 5005
@@ -50,6 +89,14 @@ CMD_FRESHNESS_TIMEOUT_S = 0.5  # stale cmd → StopMove
 
 _ZERO_CMD = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
 _stop_immediate = False
+
+# Buffer de un solo frame (siempre el mas reciente) para la ventana de camara.
+# El event loop (hilo worker) deposita aqui el frame ya decodificado; el hilo
+# main lo dibuja. Se descartan frames viejos => minima latencia.
+_frame_lock = threading.Lock()
+_display_frame = [None]   # ndarray BGR mas reciente
+_display_seq = 0          # sube con cada frame nuevo (senal para run_display)
+_frame_count = 0          # total recibidos (para fps en STATUS)
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -154,13 +201,14 @@ def lidar_callback(message: dict) -> None:
 
     angle_res = (_LIDAR_ANGLE_MAX - _LIDAR_ANGLE_MIN) / _LIDAR_NUM_BINS
     bins = np.full(_LIDAR_NUM_BINS, np.inf, dtype=np.float32)
-    for a, r in zip(angles, ranges):
-        if r < _LIDAR_RANGE_MIN or r > _LIDAR_RANGE_MAX:
-            continue
-        idx = int((a - _LIDAR_ANGLE_MIN) / angle_res)
-        if 0 <= idx < _LIDAR_NUM_BINS:
-            if r < bins[idx]:
-                bins[idx] = r
+    # Vectorizado (reemplaza el for-loop Python que ahogaba el event loop).
+    # Semantica identica al loop original: descarta fuera de rango, indexa por
+    # angulo y guarda el minimo range por bin. Formato del paquete UDP intacto.
+    valid = (ranges >= _LIDAR_RANGE_MIN) & (ranges <= _LIDAR_RANGE_MAX)
+    idx = ((angles[valid] - _LIDAR_ANGLE_MIN) / angle_res).astype(np.int64)
+    rng = ranges[valid]
+    in_bins = (idx >= 0) & (idx < _LIDAR_NUM_BINS)
+    np.minimum.at(bins, idx[in_bins], rng[in_bins])
     bins[bins == np.inf] = 0.0
 
     state.scan_seq    += 1
@@ -199,6 +247,119 @@ def odom_callback(message: dict) -> None:
     payload = struct.pack("<IIfffffff", sec, nanosec, x, y, z, qx, qy, qz, qw)
     udp_send(_udp_odom, payload, ODOM_UDP_HOST, ODOM_UDP_PORT, "odom")
 
+# ─── Video / Camara ──────────────────────────────────────────────────────────
+
+async def _video_handler(track: MediaStreamTrack) -> None:
+    """Consume el stream de video en el event loop. DOS funciones:
+      1) Keepalive de la sesion WebRTC: drenar el track evita que el robot cierre
+         la conexion por inactividad del canal de media. CRITICO (vs teleop_video2).
+      2) Si ENABLE_CAMERA, decodifica a BGR y deja SOLO el frame mas reciente en el
+         buffer; el dibujado lo hace run_display en el hilo main (GUI fuera del loop).
+    Drena a maxima velocidad y descarta frames viejos => minima latencia."""
+    global _frame_count, _display_seq
+    while True:
+        try:
+            frame = await track.recv()
+        except Exception:
+            break  # track cerrado por reconexion o shutdown
+        _frame_count += 1
+        if not ENABLE_CAMERA:
+            continue  # solo keepalive
+        try:
+            img = frame.to_ndarray(format="bgr24")
+        except Exception as e:
+            log_error_rate_limited("video_decode", str(e))
+            continue
+        with _frame_lock:
+            _display_frame[0] = img
+            _display_seq += 1
+
+
+def run_display() -> None:
+    """Ventana de camara. Corre en el hilo MAIN (cv2/Qt lo exigen). El event loop
+    vive en otro hilo, asi la GUI NO le quita tiempo a locomocion ni sensores.
+    Muestra siempre el frame mas reciente del buffer (descarta atrasados)."""
+    if not (ENABLE_CAMERA and _CV2_AVAILABLE):
+        # Sin ventana: el hilo main solo espera el shutdown para no morir.
+        while not _shutdown_event.is_set():
+            time.sleep(0.2)
+        return
+    window = "Go2 Master - Camara"
+    last_seq = -1
+    blank = np.zeros((480, 640, 3), dtype=np.uint8)
+    try:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.imshow(window, blank)
+        cv2.waitKey(1)
+    except Exception as e:
+        log("CAMERA", f"no se pudo abrir ventana ({e}); corriendo sin display")
+        while not _shutdown_event.is_set():
+            time.sleep(0.2)
+        return
+    log("CAMERA", "ventana de camara activa (hilo main) — ESC/q o cerrar para salir")
+    yolo_writer = None
+    if ENABLE_YOLO_EXPORT and _FRAME_IPC_AVAILABLE:
+        try:
+            yolo_writer = FrameWriter("go2_cam")
+            log("CAMERA", "export a YOLO activo (memoria compartida 'go2_cam')")
+        except Exception as e:
+            log_error_rate_limited("yolo_export_init", str(e))
+    shown = 0
+    while not _shutdown_event.is_set():
+        with _frame_lock:
+            seq = _display_seq
+            frame = _display_frame[0]
+        if frame is not None and seq != last_seq:
+            try:
+                cv2.imshow(window, frame)
+                shown += 1
+                last_seq = seq
+            except Exception as e:
+                log_error_rate_limited("camera_show", str(e))
+            if yolo_writer is not None:
+                try:
+                    yolo_writer.write(frame, seq)
+                except Exception as e:
+                    log_error_rate_limited("yolo_export", str(e))
+        key = cv2.waitKey(10) & 0xFF
+        if key in (27, ord('q')):          # ESC o q
+            _shutdown_event.set()
+            break
+        try:
+            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                _shutdown_event.set()       # cerraron la ventana con la X
+                break
+        except Exception:
+            break
+    try:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+    except Exception:
+        pass
+    if yolo_writer is not None:
+        try:
+            yolo_writer.close()
+        except Exception:
+            pass
+    log("CAMERA", f"display terminado  frames_mostrados={shown}")
+
+
+async def status_loop() -> None:
+    """Heartbeat de estado en consola cada STATUS_INTERVAL_S segundos. Util para
+    debug y auditoria: estado de conexion, tasa de LiDAR/ODOM y fps de camara."""
+    if STATUS_INTERVAL_S <= 0:
+        return
+    prev_scan = prev_odom = prev_frames = 0
+    while state.connection_state != LifecycleState.SHUTDOWN:
+        await asyncio.sleep(STATUS_INTERVAL_S)
+        scan_hz = (state.scan_seq  - prev_scan)   / STATUS_INTERVAL_S
+        odom_hz = (state.odom_seq  - prev_odom)   / STATUS_INTERVAL_S
+        cam_fps = (_frame_count    - prev_frames) / STATUS_INTERVAL_S
+        prev_scan, prev_odom, prev_frames = state.scan_seq, state.odom_seq, _frame_count
+        log("STATUS",
+            f"conn={state.connection_state.name}  "
+            f"lidar={scan_hz:4.1f}hz  odom={odom_hz:4.1f}hz  cam={cam_fps:4.1f}fps")
+
 # ─── ConnectionMonitor ────────────────────────────────────────────────────────
 
 class ConnectionMonitor:
@@ -216,6 +377,8 @@ class ConnectionMonitor:
             self.tick()
 
     def tick(self) -> None:
+        if not ENABLE_SENSORS:
+            return  # sin sensores no hay nada que monitorear
         now = time.monotonic()
 
         scan_delta = state.scan_seq - self._prev_scan_seq
@@ -428,7 +591,7 @@ async def send_stop_move(conn: UnitreeWebRTCConnection) -> None:
 
 _monitor: ConnectionMonitor | None = None
 _ipc: IPCServer | None = None
-_shutdown_event = asyncio.Event()
+_shutdown_event = threading.Event()
 
 def handle_sigint(sig, frame) -> None:
     print("\n", flush=True)
@@ -464,8 +627,6 @@ RECONNECT_DELAY_S = 15.0  # espera entre reconexiones
 async def main() -> None:
     global _monitor, _ipc
 
-    signal.signal(signal.SIGINT, handle_sigint)
-
     # IPC y monitor se crean una sola vez
     cmd_queue: asyncio.Queue = asyncio.Queue(maxsize=CMD_QUEUE_MAXSIZE)
     _ipc = IPCServer(cmd_queue)
@@ -473,6 +634,12 @@ async def main() -> None:
 
     _monitor = ConnectionMonitor()
     _monitor.start()
+
+    # Observabilidad: heartbeat de estado (la camara corre en el hilo main)
+    asyncio.create_task(status_loop())
+    _cam_state = "ON" if (ENABLE_CAMERA and _CV2_AVAILABLE) else "OFF"
+    _sen_state = "ON" if ENABLE_SENSORS else "OFF"
+    log("INIT", "camara=" + _cam_state + "  sensores=" + _sen_state)
 
     while not _shutdown_event.is_set():
         set_lifecycle(LifecycleState.CONNECTING)
@@ -489,9 +656,21 @@ async def main() -> None:
             continue
 
         set_lifecycle(LifecycleState.CONNECTED)
-        conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ULIDAR_ARRAY"], lidar_callback)
-        conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ROBOTODOM"],    odom_callback)
-        log("INIT", "subscribed  topics=[ULIDAR_ARRAY, ROBOTODOM]")
+        if ENABLE_SENSORS:
+            conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ULIDAR_ARRAY"], lidar_callback)
+            conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ROBOTODOM"],    odom_callback)
+            log("INIT", "subscribed  topics=[ULIDAR_ARRAY, ROBOTODOM]")
+        else:
+            log("INIT", "SENSORS OFF (ENABLE_SENSORS=False) — sin LiDAR/ODOM, modo diagnostico")
+        # Video / Camara — el baseline teleop_video2.py mantiene la sesion viva
+        # consumiendo el stream RTP. Sin esto la sesion WebRTC se cierra sola.
+        try:
+            conn.video.switchVideoChannel(True)
+            conn.video.add_track_callback(_video_handler)
+            modo = "streaming+keepalive" if ENABLE_CAMERA else "keepalive"
+            log("INIT", "video activo (" + modo + ")")
+        except Exception as e:
+            log_error_rate_limited("video", str(e))
         # BalanceStand — activa gait controller antes de aceptar comandos
         await asyncio.sleep(1.0)
         try:
@@ -560,5 +739,37 @@ async def shutdown_final() -> None:
         pass
     log("LIFECYCLE", "state=SHUTDOWN")
 
+def _run_bridge() -> None:
+    """Corre el bridge asyncio (WebRTC + IPC + sensores + locomocion) en un hilo
+    aparte, dejando el hilo MAIN libre para la GUI de cv2."""
+    worker_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(worker_loop)
+    try:
+        worker_loop.run_until_complete(main())
+    except Exception as e:
+        log_error_rate_limited("bridge", str(e))
+    finally:
+        try:
+            pendientes = asyncio.all_tasks(worker_loop)
+            for t in pendientes:
+                t.cancel()
+            if pendientes:
+                worker_loop.run_until_complete(
+                    asyncio.gather(*pendientes, return_exceptions=True))
+        except Exception:
+            pass
+        worker_loop.close()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # SIGINT y cv2 deben vivir en el hilo MAIN. El bridge va en un hilo worker.
+    signal.signal(signal.SIGINT, handle_sigint)
+    _bridge = threading.Thread(target=_run_bridge, name="go2-bridge", daemon=True)
+    _bridge.start()
+    try:
+        run_display()              # bloquea en el hilo main hasta el shutdown
+    except KeyboardInterrupt:
+        _shutdown_event.set()
+    finally:
+        _shutdown_event.set()
+        _bridge.join(timeout=6.0)

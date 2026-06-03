@@ -211,6 +211,7 @@ def main():
             was_moving = last_state["vx"] != 0 or last_state["vy"] != 0 or last_state["wz"] != 0
 
             if moving:
+                touch_input()  # tecla sostenida = input activo; evita el falso watchdog
                 ipc.send_cmd(state["vx"], state["vy"], state["wz"])
                 print(f"\r  vx={state['vx']:+.2f}  vy={state['vy']:+.2f}  wz={state['wz']:+.2f}    ",
                       end="", flush=True)
