@@ -1,36 +1,30 @@
-# Python
+# --- Secretos: NUNCA subir ---
+.env
+*.env
+*secret*
+*aes*key*
+
+# --- Logs de corridas (pesados, no van a git) ---
+runs/
+*.log
+
+# --- Respaldos locales del master ---
+*.bak
+
+# --- Python ---
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-*.egg-info/
-
-# Virtual environments
 venv/
-.env/
-go2_legacy_env/
+.venv/
+*_env/
 
-# Logs
-*.log
-logs/
+# --- Modelos pesados (opcional: descomenta si no quieres versionar el .pt) ---
+# *.pt
 
-# Runtime dumps
-*.json
-*.dump
-
-# ROS2
-build/
-install/
-log/
-
-# VSCode
-.vscode/
-
-# Secrets
-*.key
-*.pem
-.envrc
-
-# OS
+# --- Sistema / editor ---
 .DS_Store
-Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.pt

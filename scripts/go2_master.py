@@ -62,7 +62,7 @@ ENABLE_CAMERA = True
 # False = master se comporta identico al auditado (esta ruta no se ejecuta).
 # True = en run_display (hilo main) se copia el frame mas reciente a un buzon
 # de memoria compartida que yolo_viewer.py lee desde otro proceso/venv.
-ENABLE_YOLO_EXPORT = False
+ENABLE_YOLO_EXPORT = True
 
 # Heartbeat de estado en consola cada N segundos (observabilidad/auditoria).
 # Sube el valor para menos ruido; pon 0 para desactivarlo.
@@ -84,17 +84,62 @@ MONITOR_INTERVAL_S = 1.0
 SPORT_MOD_PUBLISH_HZ = 20
 SPORT_MOD_INTERVAL   = 1.0 / SPORT_MOD_PUBLISH_HZ
 
+# Throttle de repeticiones de Move (anti-saturacion del canal de comandos).
+# True  = manda Move al INSTANTE cuando cambia tu tecla, y repite el MISMO
+#         comando solo a CMD_REFRESH_HZ (no a 20Hz). Respuesta a la tecla sigue
+#         siendo inmediata; solo se reduce la repeticion inutil. Trafico ~2.5x menor.
+# False = comportamiento viejo (Move continuo a 20Hz). Para comparar A/B.
+# StopMove y el freshness-watchdog NO cambian (siguen tal cual, son seguridad).
+THROTTLE_REPEATS = True
+CMD_REFRESH_HZ   = 8            # repeticion del MISMO comando; ajustable (6-12)
+CMD_REFRESH_INTERVAL = 1.0 / CMD_REFRESH_HZ
+
 CMD_QUEUE_MAXSIZE = 20
 CMD_FRESHNESS_TIMEOUT_S = 0.5  # stale cmd → StopMove
 
 _ZERO_CMD = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
 _stop_immediate = False
 
+# ─── Perfilado de latencia (SOLO medicion; NO altera la logica de control) ────
+# False = master identico al actual. True = acumula tiempos y los reporta en
+# lineas [PROF] cada STATUS_INTERVAL_S (junto al heartbeat), sin floodear el log.
+ENABLE_PROFILING = True
+_prof = {"q_lag_ms": [], "send_ms": [], "loop_dt_ms": [], "lidar_cb_ms": [], "odom_cb_ms": []}
+_prof_counts = {"move_sent": 0, "move_skipped": 0}
+# Peso del LiDAR que llega por WiFi (proxy de carga del canal): puntos crudos por scan.
+_lidar_pts_sum = 0
+_lidar_scans = 0
+
+def _prof_report() -> None:
+    """Imprime min/avg/max de cada metrica acumulada y limpia. Lo llama status_loop."""
+    if not ENABLE_PROFILING:
+        return
+    for k, vals in _prof.items():
+        if vals:
+            lo = min(vals); hi = max(vals); avg = sum(vals) / len(vals)
+            log("PROF", f"{k:10s} n={len(vals):4d}  min={lo:6.1f}  avg={avg:6.1f}  max={hi:6.1f}  (ms)")
+            vals.clear()
+    if _prof_counts["move_sent"] or _prof_counts["move_skipped"]:
+        log("PROF", f"moves      sent={_prof_counts['move_sent']:4d}  "
+                    f"skipped={_prof_counts['move_skipped']:4d}  (throttle)")
+        _prof_counts["move_sent"] = 0
+        _prof_counts["move_skipped"] = 0
+    global _lidar_pts_sum, _lidar_scans
+    if _lidar_scans > 0:
+        pts_scan = _lidar_pts_sum / _lidar_scans
+        pts_s = _lidar_pts_sum / STATUS_INTERVAL_S
+        kbs = pts_s * 12.0 / 1024.0   # proxy: 3 float32 (x,y,z) por punto, decodificado
+        log("PROF", f"lidar_load pts/scan={pts_scan:7.0f}  pts/s={pts_s:8.0f}  ~{kbs:7.1f} KB/s (proxy)")
+        _lidar_pts_sum = 0
+        _lidar_scans = 0
+
 # Buffer de un solo frame (siempre el mas reciente) para la ventana de camara.
-# El event loop (hilo worker) deposita aqui el frame ya decodificado; el hilo
-# main lo dibuja. Se descartan frames viejos => minima latencia.
+# CLAVE (videofix): el event loop solo DEPOSITA el frame CRUDO (sin decodificar);
+# la decodificacion pesada (to_ndarray) la hace el hilo main en run_display.
+# Asi el decode NO le quita tiempo al lazo de control. Se descartan frames
+# viejos => minima latencia y locomocion protegida.
 _frame_lock = threading.Lock()
-_display_frame = [None]   # ndarray BGR mas reciente
+_raw_frame = [None]       # frame CRUDO (av.VideoFrame) mas reciente, sin decodificar
 _display_seq = 0          # sube con cada frame nuevo (senal para run_display)
 _frame_count = 0          # total recibidos (para fps en STATUS)
 
@@ -141,8 +186,14 @@ state = RobotState()
 
 _last_error_log: dict[str, float] = {}
 
+_RUN_T0 = time.monotonic()   # marca de inicio de corrida (para sello t=MM:SS)
+
+def _elapsed_tag() -> str:
+    s = int(time.monotonic() - _RUN_T0)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
 def log(tag: str, msg: str) -> None:
-    print(f"[{tag}] {msg}", flush=True)
+    print(f"[t={_elapsed_tag()}] [{tag}] {msg}", flush=True)
 
 def log_error_rate_limited(category: str, msg: str) -> None:
     now = time.monotonic()
@@ -181,6 +232,7 @@ _LIDAR_RANGE_MAX  = 10.0
 _LIDAR_NUM_BINS   = 360
 
 def lidar_callback(message: dict) -> None:
+    _t0_lidar = time.monotonic()
     try:
         d      = message["data"]
         origin = np.array(d["origin"], dtype=np.float32)
@@ -193,6 +245,11 @@ def lidar_callback(message: dict) -> None:
     pts_2d = pts[mask]
     if len(pts_2d) == 0:
         return
+
+    # Peso del LiDAR (proxy de carga del canal WiFi): puntos crudos recibidos.
+    global _lidar_pts_sum, _lidar_scans
+    _lidar_pts_sum += pts.shape[0]
+    _lidar_scans += 1
 
     xyz    = origin + pts_2d * _LIDAR_RESOLUTION
     x, y   = xyz[:, 0], xyz[:, 1]
@@ -219,8 +276,11 @@ def lidar_callback(message: dict) -> None:
                           _LIDAR_RANGE_MIN, _LIDAR_RANGE_MAX)
     payload = header + bins.tobytes()
     udp_send(_udp_lidar, payload, LIDAR_UDP_HOST, LIDAR_UDP_PORT, "lidar")
+    if ENABLE_PROFILING:
+        _prof["lidar_cb_ms"].append((time.monotonic() - _t0_lidar) * 1000.0)
 
 def odom_callback(message: dict) -> None:
+    _t0_odom = time.monotonic()
     try:
         d   = message["data"]
         hdr = d.get("header", {}).get("stamp", {})
@@ -246,6 +306,8 @@ def odom_callback(message: dict) -> None:
 
     payload = struct.pack("<IIfffffff", sec, nanosec, x, y, z, qx, qy, qz, qw)
     udp_send(_udp_odom, payload, ODOM_UDP_HOST, ODOM_UDP_PORT, "odom")
+    if ENABLE_PROFILING:
+        _prof["odom_cb_ms"].append((time.monotonic() - _t0_odom) * 1000.0)
 
 # ─── Video / Camara ──────────────────────────────────────────────────────────
 
@@ -265,13 +327,10 @@ async def _video_handler(track: MediaStreamTrack) -> None:
         _frame_count += 1
         if not ENABLE_CAMERA:
             continue  # solo keepalive
-        try:
-            img = frame.to_ndarray(format="bgr24")
-        except Exception as e:
-            log_error_rate_limited("video_decode", str(e))
-            continue
+        # videofix: NO decodificar aqui (eso ahogaba el lazo de control).
+        # Solo dejamos el frame CRUDO; run_display (hilo main) lo decodifica.
         with _frame_lock:
-            _display_frame[0] = img
+            _raw_frame[0] = frame
             _display_seq += 1
 
 
@@ -308,19 +367,26 @@ def run_display() -> None:
     while not _shutdown_event.is_set():
         with _frame_lock:
             seq = _display_seq
-            frame = _display_frame[0]
-        if frame is not None and seq != last_seq:
+            raw = _raw_frame[0]
+        if raw is not None and seq != last_seq:
+            # videofix: la decodificacion pesada ocurre AQUI (hilo main), no en el loop
             try:
-                cv2.imshow(window, frame)
-                shown += 1
-                last_seq = seq
+                frame = raw.to_ndarray(format="bgr24")
             except Exception as e:
-                log_error_rate_limited("camera_show", str(e))
-            if yolo_writer is not None:
+                log_error_rate_limited("video_decode", str(e))
+                frame = None
+            if frame is not None:
                 try:
-                    yolo_writer.write(frame, seq)
+                    cv2.imshow(window, frame)
+                    shown += 1
+                    last_seq = seq
                 except Exception as e:
-                    log_error_rate_limited("yolo_export", str(e))
+                    log_error_rate_limited("camera_show", str(e))
+                if yolo_writer is not None:
+                    try:
+                        yolo_writer.write(frame, seq)
+                    except Exception as e:
+                        log_error_rate_limited("yolo_export", str(e))
         key = cv2.waitKey(10) & 0xFF
         if key in (27, ord('q')):          # ESC o q
             _shutdown_event.set()
@@ -359,6 +425,7 @@ async def status_loop() -> None:
         log("STATUS",
             f"conn={state.connection_state.name}  "
             f"lidar={scan_hz:4.1f}hz  odom={odom_hz:4.1f}hz  cam={cam_fps:4.1f}fps")
+        _prof_report()
 
 # ─── ConnectionMonitor ────────────────────────────────────────────────────────
 
@@ -473,6 +540,8 @@ class IPCServer:
                 "vy": float(msg.get("vy", 0.0)),
                 "wz": float(msg.get("wz", 0.0)),
             }
+            if ENABLE_PROFILING:
+                cmd["_ts_in"] = time.monotonic()
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
@@ -509,6 +578,9 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
     last_cmd = _ZERO_CMD.copy()
     was_moving = False
     last_cmd_ts = time.monotonic()  # freshness — master es dueño del clock
+    _prof_loop_prev = time.monotonic()  # perfilado: marca de la vuelta anterior
+    last_sent = _ZERO_CMD.copy()        # ultimo Move realmente enviado al robot
+    last_sent_ts = 0.0                  # cuando se envio (para refresco lento)
     try:
         while state.connection_state not in (LifecycleState.SHUTDOWN,):
             global _stop_immediate
@@ -527,10 +599,16 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
                 await asyncio.sleep(0)
                 continue
             await asyncio.sleep(SPORT_MOD_INTERVAL)
+            if ENABLE_PROFILING:
+                _now = time.monotonic()
+                _prof["loop_dt_ms"].append((_now - _prof_loop_prev) * 1000.0)
+                _prof_loop_prev = _now
             while not cmd_queue.empty():
                 try:
                     last_cmd = cmd_queue.get_nowait()
                     last_cmd_ts = time.monotonic()  # cmd fresco — actualizar timestamp
+                    if ENABLE_PROFILING and "_ts_in" in last_cmd:
+                        _prof["q_lag_ms"].append((last_cmd_ts - last_cmd["_ts_in"]) * 1000.0)
                 except asyncio.QueueEmpty:
                     break
             moving = not (last_cmd["vx"] == 0.0 and last_cmd["vy"] == 0.0 and last_cmd["wz"] == 0.0)
@@ -550,20 +628,35 @@ async def publish_loop(conn: UnitreeWebRTCConnection, cmd_queue: asyncio.Queue) 
                 was_moving = False
                 continue
             if moving:
-                try:
-                    await conn.datachannel.pub_sub.publish_request_new(
-                        RTC_TOPIC["SPORT_MOD"],
-                        {
-                            "api_id": SPORT_CMD["Move"],
-                            "parameter": {
-                                "x": last_cmd["vx"],
-                                "y": last_cmd["vy"],
-                                "z": last_cmd["wz"],
+                # Throttle anti-saturacion: manda al INSTANTE si el comando cambio,
+                # y si es el MISMO, solo lo repite cada CMD_REFRESH_INTERVAL (no 20Hz).
+                changed = (last_cmd["vx"] != last_sent["vx"] or
+                           last_cmd["vy"] != last_sent["vy"] or
+                           last_cmd["wz"] != last_sent["wz"])
+                due = (time.monotonic() - last_sent_ts) >= CMD_REFRESH_INTERVAL
+                if (not THROTTLE_REPEATS) or changed or due:
+                    try:
+                        _t_send = time.monotonic()
+                        await conn.datachannel.pub_sub.publish_request_new(
+                            RTC_TOPIC["SPORT_MOD"],
+                            {
+                                "api_id": SPORT_CMD["Move"],
+                                "parameter": {
+                                    "x": last_cmd["vx"],
+                                    "y": last_cmd["vy"],
+                                    "z": last_cmd["wz"],
+                                },
                             },
-                        },
-                    )
-                except Exception as e:
-                    log_error_rate_limited("sport_pub", str(e))
+                        )
+                        last_sent = {"vx": last_cmd["vx"], "vy": last_cmd["vy"], "wz": last_cmd["wz"]}
+                        last_sent_ts = time.monotonic()
+                        if ENABLE_PROFILING:
+                            _prof["send_ms"].append((time.monotonic() - _t_send) * 1000.0)
+                            _prof_counts["move_sent"] += 1
+                    except Exception as e:
+                        log_error_rate_limited("sport_pub", str(e))
+                elif ENABLE_PROFILING:
+                    _prof_counts["move_skipped"] += 1
             elif was_moving and not moving:
                 # StopMove solo en transicion movimiento -> cero
                 try:

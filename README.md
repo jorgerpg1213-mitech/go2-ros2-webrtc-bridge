@@ -78,7 +78,7 @@ docker exec -it go2_ros2 bash -c \
 ### T4 — go2_master.py (Host)
 ```bash
 source ~/go2_legacy_env/bin/activate && \
-export GO2_AES_KEY="5a22d44799557573192d8c2b54da0c1a" && \
+export GO2_AES_KEY="${GO2_AES_KEY}" && \
 python3 ~/go2-ros2-webrtc-bridge/scripts/go2_master.py
 ```
 
