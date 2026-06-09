@@ -1,369 +1,229 @@
-# Go2 Pro — ROS2 WebRTC Bridge
-## Unitree Go2 Pro :: Deterministic Runtime Engineering Platform
+# go2-ros2-webrtc-bridge
 
-Real-time teleoperation and sensor pipeline for the Unitree Go2 Pro quadruped robot.  
-Single WebRTC session — LiDAR + Odometry + Teleop over one connection.
+Puente entre un robot **Unitree Go2 Pro** y **ROS 2 (Humble)** sobre el canal **WebRTC**
+del robot, con teleoperación, video con detección **YOLO**, y dos modalidades de mapeo
+externo (**SLAM 2D** y **nube de puntos voxel 3D**).
 
-Built with runtime engineering discipline: lifecycle-correct asyncio, deterministic teardown,
-freshness policy, and clean reconnect semantics.
-
----
-
-## Architecture
-
-```
-HOST
-┌─────────────────────────────────────────────┐
-│  go2_master.py                              │
-│                                             │
-│  WebRTC (única sesión — LocalAP)            │
-│  ├── ULIDAR_ARRAY → UDP 5005 → /scan        │
-│  ├── ROBOTODOM   → UDP 5006 → /odom + TF    │
-│                                             │
-│  ConnectionMonitor (1Hz)                    │
-│  ├── lidar timeout detection >2s            │
-│  ├── odom timeout detection >2s             │
-│  └── lifecycle state management             │
-│                                             │
-│  IPC Unix Socket /tmp/go2_master.sock       │
-│  └── JSON command receiver                  │
-│                                             │
-│  publish_loop 20Hz                          │
-│  ├── cmd_queue consumer                     │
-│  ├── _stop_immediate flag                   │
-│  └── SPORT_MOD → Move / StopMove            │
-│                                             │
-│  ReconnectManager — auto 15s delay          │
-│  └── stale queue flush on each reconnect    │
-└─────────────────────────────────────────────┘
-          ↑ JSON IPC
-┌─────────────────────────────────────────────┐
-│  teleop_client.py                           │
-│  pynput → key press/release → JSON → socket │
-│  deadman watchdog 0.5s                      │
-└─────────────────────────────────────────────┘
-
-DOCKER (go2_ros2)
-├── lidar_ros_publisher.py   UDP 5005 → /scan
-├── odom_ros_publisher.py    UDP 5006 → /odom + TF
-└── static_transform_publisher  base_link → laser
-```
+Todo corre desde una laptop sobre la red local del robot (LocalAP, `192.168.12.1`),
+sin Jetson, sin Expansion Dock y sin LiDAR externo.
 
 ---
 
-## Runtime Stack
+## 1. Plataforma
 
-### T1 — LiDAR ROS Publisher
+| Componente | Detalle |
+|---|---|
+| Robot | Unitree Go2 **Pro** (LiDAR L1 interno, sin Expansion Dock) |
+| Enlace | WebRTC directo (LocalAP `192.168.12.1`) |
+| Host | Laptop Ubuntu 22.04, Python 3.10 |
+| ROS 2 | Humble, dentro de contenedor Docker `osrf/ros:humble-desktop` (`--network host`) |
+| Venv maestro | `~/go2_legacy_env` (conexión + master) |
+| Venv YOLO | `~/go2-yolo` (detección aislada) |
+
+La clave de cifrado (`GO2_AES_KEY`) **nunca** se versiona: se lee del entorno y está
+bloqueada por `.gitignore`.
+
+---
+
+## 2. Arquitectura
+
+### 2.1 Una sola conexión, un solo event loop
+
+El robot Go2 admite **una única sesión WebRTC simultánea**. Toda la telemetría
+(video, LiDAR, odometría) y todos los comandos (teleop) viajan por **ese mismo canal**,
+procesados por **un solo event loop asyncio en un solo hilo**.
+
+```
+                 +-----------------------------+
+   Go2 Pro  <----+   go2_master.py (1 hilo)     +----> UDP 5005  scan 2D   -> ROS2
+  (WebRTC)  ---->+   - recibe video/lidar/odom  +----> UDP 5006  odom+TF   -> ROS2
+                 |   - manda comandos teleop    +----> UDP 5007  nube 3D   -> ROS2
+                 |   - escribe frame a IPC      +----> shared mem -> YOLO (otro venv)
+                 +-----------------------------+
+```
+
+Consecuencia de diseño: **no hay paralelismo real dentro de la conexión**. Si una tarea
+pesada ocupa el event loop, todo lo demás (incluido el teleop) espera. Este hecho domina
+todo lo que sigue.
+
+### 2.2 Procesos
+
+- **`go2_master.py`** (host, venv maestro): dueño único de la conexión WebRTC. Recibe los
+  streams, los reenvía por UDP a los nodos ROS 2, escribe el frame de video a memoria
+  compartida para YOLO, y aplica los comandos de teleop que recibe por su socket Unix.
+- **`yolo_viewer.py`** (host, venv YOLO): lee el frame por IPC y corre la detección,
+  **aislado** del proceso maestro para no contaminar el event loop.
+- **Nodos ROS 2** (dentro de Docker): `lidar_ros_publisher.py`, `odom_ros_publisher.py`,
+  `cloud_ros_publisher.py`, `slam_toolbox`, `rviz2`.
+- **`teleop_client.py`** (host): proceso aparte; manda comandos al maestro por
+  `/tmp/go2_master.sock`.
+
+---
+
+## 3. El cuello del teleop (hallazgo central)
+
+Al activar el LiDAR, el teleop se degradaba progresivamente hasta morir. La causa **no**
+es falta de CPU.
+
+### 3.1 Diagnóstico
+
+El robot publica la nube comprimida del LiDAR en el topic
+`rt/utlidar/voxel_map_compressed` (constante `ULIDAR_ARRAY`). La librería la **descomprime
+con un decoder WASM (`libvoxel`)** dentro del *handler de recepción del data channel*
+(`webrtc_datachannel.py` → `deal_array_buffer_for_lidar`), es decir **antes** de que el dato
+llegue a nuestro callback, y **dentro del event loop**.
+
+Medición clave (perfilado del maestro):
+
+```
+loop_dt_ms ... max=14001.7   <- el event loop se bloqueó hasta 14 s
+lidar_cb_ms ... avg=8.5      <- nuestro callback es trivial (<10 ms)
+pts/scan = 280000+           <- la nube crece al explorar
+```
+
+Un decode tarda **< 1 s**, pero el loop llegó a bloquearse **14 s**. Eso **no es costo de
+cómputo**: es **congestión del carril único**. El decode pesado, ejecutándose en el mismo
+hilo que el teleop, mete a todos los demás eventos en una fila que se desborda. Y empeora
+con el tiempo porque la nube crece (215k → 280k+ puntos) conforme el robot explora.
+
+### 3.2 Conclusión sobre hardware
+
+Comprar una CPU con más núcleos **no resuelve** este cuello: el límite es el **diseño de un
+solo event loop**, no la potencia. Núcleos extra quedarían ociosos. Lo único que ayudaría
+a fondo sería sacar el decode a **otro proceso** (multiprocessing real), lo cual exige
+modificar cómo la librería entrega los datos. No se adquirió hardware por esta razón.
+
+---
+
+## 4. Mitigaciones implementadas
+
+### 4.1 `patch_skip_decode.py` — saltar el decode pesado
+
+Parche a `webrtc_datachannel.py` que decodea **1 de cada N** frames del LiDAR. Los frames
+saltados **reusan la última nube decodeada** (nunca devuelven `None`, así no rompen los
+callbacks de aguas abajo).
+
+- Controlado por la variable de entorno **`LIDAR_DECODE_EVERY_N`** (default `1` = decodea
+  todo = comportamiento idéntico al original).
+- Respaldo automático (`.skipdecode.bak`); reversible con `--revert`.
+- Aborta sin tocar nada si el bloque original no coincide; restaura solo si no compila.
+
+Detalle de por qué funciona: en `pub_sub.py`, `subscribe`/`unsubscribe` mandan mensajes
+`SUBSCRIBE`/`UNSUBSCRIBE` reales al robot (no son solo registros locales de callback). El
+flujo del LiDAR se controla de raíz; el decode solo ocurre sobre lo que el robot manda.
+
 ```bash
-docker run --rm -it --name go2_ros2 --network host \
-  -v ~/go2-ros2-webrtc-bridge/scripts:/scripts \
-  osrf/ros:humble-desktop bash -c \
-  "source /opt/ros/humble/setup.bash && python3 /scripts/lidar_ros_publisher.py"
+python3 scripts/patch_skip_decode.py          # aplicar
+python3 scripts/patch_skip_decode.py --revert  # revertir
 ```
 
-### T2 — Odometry ROS Publisher
+### 4.2 `patch_cloud3d.py` — salida de nube voxel 3D
+
+Parche **aditivo** al maestro. Los puntos 3D en coordenadas del mundo (`xyz`, ya calculados
+en el callback del LiDAR) se mandan por **UDP 5007** a `cloud_ros_publisher.py`, que los
+acumula y publica como `sensor_msgs/PointCloud2` en `/cloud` (frame `odom`).
+
+- Controlado por **`ENABLE_CLOUD3D`** (default `0` = apagado, no afecta a las otras pruebas).
+- **Downsample** a `CLOUD_MAX_PTS = 5000` puntos: mantiene la nube ligera y dentro del
+  límite de un datagrama UDP.
+- Anclas únicas; respaldo `.precloud3d.bak`; verifica compilación y restaura si falla.
+
 ```bash
-docker exec -it go2_ros2 bash -c \
-  "source /opt/ros/humble/setup.bash && python3 /scripts/odom_ros_publisher.py"
+python3 scripts/patch_cloud3d.py          # aplicar
+python3 scripts/patch_cloud3d.py --revert  # revertir
 ```
 
-### T3 — Static Transform Publisher
+---
+
+## 5. SLAM interno del robot: descartado
+
+Se investigó a fondo activar el SLAM **interno** del Go2 (topics `rt/uslam/...`,
+`rt/mapping/grid_map`). Hallazgo: el servicio `uslam` que activa el mapeo **solo existe en
+la variante EDU con Expansion Dock + LiDAR externo vía Ethernet/DDS**. En el **Pro** sobre
+WebRTC, el `server_log` hace eco del comando pero **ningún topic de mapa publica jamás** —
+no hay servicio escuchando. Ningún proyecto WebRTC público lo ha logrado en un Pro.
+
+Por eso **todo el mapeo de este repo es externo**: se toma la nube cruda del LiDAR y se
+construye el mapa en el host (slam_toolbox para 2D, acumulación de nube para 3D).
+
+Los diagnósticos de esa investigación quedan archivados en `scripts/diag_slam_*.py` como
+evidencia, sin uso operativo.
+
+---
+
+## 6. Las tres pruebas
+
+| Test | Entrega | Lanzador | Carpeta |
+|---|---|---|---|
+| 1 | Cámara + YOLO + teleop | `scripts/go2_run.sh` | `tests/test1_camara_yolo/` |
+| 2 | SLAM 2D + teleop | `scripts/go2_launch.sh` | `tests/test2_slam2d/` |
+| 3 | Voxel 3D + teleop | `scripts/go2_launch_voxel3d.sh` | `tests/test3_voxel3d/` |
+
+Cada carpeta `tests/` tiene su propio README con comandos exactos. Resumen también en
+`pruebas_go2.docx`.
+
+---
+
+## 7. Interruptores del maestro (variables de entorno)
+
+| Variable | Default | Efecto |
+|---|---|---|
+| `ENABLE_CAMERA` | `1` | Procesa/Muestra el video (y alimenta YOLO). |
+| `ENABLE_LIDAR` | `0` | Suscribe la nube del LiDAR y publica scan 2D (UDP 5005). |
+| `ENABLE_ODOM` | `0` | Suscribe odometría y publica `/odom` + TF (UDP 5006). |
+| `ENABLE_CLOUD3D` | `0` | Manda la nube 3D al publisher (UDP 5007). |
+| `LIDAR_DECODE_EVERY_N` | `1` | Decodea 1 de cada N frames del LiDAR (requiere patch). |
+
+Los lanzadores fijan la combinación correcta de cada prueba; no hace falta exportarlas a mano.
+
+---
+
+## 8. Limitación conocida
+
+**Voxel 3D + cámara simultáneos saturan el event loop** y degradan el teleop (video y nube
+pesada compiten por el carril único). Por eso las pruebas 2 y 3 corren **sin cámara**.
+El cuello es **arquitectónico** (un solo canal/event loop), no de CPU.
+
+---
+
+## 9. Limpieza entre corridas
+
+El robot admite una sola sesión WebRTC; tras muchas conexiones seguidas el enlace puede
+quedar en `CONNECTING`. Antes de cada prueba:
+
 ```bash
-docker exec -it go2_ros2 bash -c \
-  "source /opt/ros/humble/setup.bash && \
-   ros2 run tf2_ros static_transform_publisher \
-   --frame-id base_link --child-frame-id laser"
+pkill -9 -f "go2_master.py" ; pkill -9 -f "teleop_client" ; pkill -9 -f "yolo" ; \
+pkill -9 -f "go2_launch" ; pkill -9 -f "go2_run" ; \
+docker rm -f go2_ros 2>/dev/null ; rm -f /tmp/go2_master.sock ; sleep 2 ; echo "LIMPIO"
 ```
 
-### T4 — go2_master.py (Host)
-```bash
-source ~/go2_legacy_env/bin/activate && \
-export GO2_AES_KEY="${GO2_AES_KEY}" && \
-python3 ~/go2-ros2-webrtc-bridge/scripts/go2_master.py
-```
-
-### T5 — teleop_client.py (Host — esperar BalanceStand en T4)
-```bash
-source ~/go2_legacy_env/bin/activate && \
-python3 ~/go2-ros2-webrtc-bridge/scripts/teleop_client.py
-```
-
-### T6 — RViz
-```bash
-xhost +local:docker && \
-docker exec -it -e DISPLAY=$DISPLAY go2_ros2 bash -c \
-  "source /opt/ros/humble/setup.bash && rviz2"
-```
-
-**RViz config:**
-- Fixed Frame → `odom`
-- Add → LaserScan → topic `/scan`
-- Add → TF
+Si el maestro se queda en `CONNECTING`, reiniciar el robot físicamente y verificar con una
+conexión mínima antes de relanzar el stack completo.
 
 ---
 
-## Teleop Controls
-
-| Key   | Action         | Speed      |
-|-------|----------------|------------|
-| W / ↑ | Forward        | 0.5 m/s    |
-| S / ↓ | Backward       | -0.4 m/s   |
-| A / ← | Turn left      | 1.2 rad/s  |
-| D / → | Turn right     | -1.2 rad/s |
-| Q     | Strafe left    | 0.3 m/s    |
-| E     | Strafe right   | -0.3 m/s   |
-| SPACE | Emergency stop | —          |
-| ESC   | Exit           | —          |
-
-Deadman watchdog: 0.5s sin input → StopMove automático.
-
----
-
-## Lifecycle States
-
-| State         | Description                         |
-|---------------|-------------------------------------|
-| INITIALIZING  | Process startup                     |
-| CONNECTING    | WebRTC negotiation                  |
-| CONNECTED     | Data flowing                        |
-| DEGRADED      | LiDAR or ODOM timeout detected      |
-| DISCONNECTED  | WebRTC dropped — awaiting reconnect |
-| SHUTDOWN      | Clean deterministic teardown        |
-
----
-
-## Runtime Engineering — Fixes Aplicados
-
-Esta sección documenta el trabajo de auditoría y hardening del runtime asyncio.
-El sistema pasó de "funcional" a "determinísticamente robusto" mediante fixes quirúrgicos
-aplicados bajo metodología: síntomas → auditoría → diagnóstico → fix dirigido → validación.
-
-### Problema A — Lifecycle asyncio incompleto
-
-**Fix 1 — CRÍTICO: pub_task lifecycle completo**
-
-Antes:
-```python
-pub_task.cancel()
-await conn.close()  # race condition — SCTP flush sobre transport muerto
-```
-
-Después:
-```python
-pub_task.cancel()
-try:
-    await pub_task          # esperar terminación limpia
-except asyncio.CancelledError:
-    pass
-try:
-    await conn.close()      # transport libre — sin race condition
-except Exception:
-    pass
-```
-
-`publish_loop` ahora tiene `try/except CancelledError/finally` completo:
-```python
-try:
-    while ...:
-        ...
-except asyncio.CancelledError:
-    pass
-finally:
-    log("SPORT", "publish_loop terminado")
-```
-
-**Evidencia directa antes del fix:** `Task exception was never retrieved` + `Cannot send data, not connected` en logs de runtime.
-
----
-
-**Fix 2 — ALTO: ConnectionMonitor.stop() con await**
-
-Antes:
-```python
-def stop(self) -> None:
-    if self._task:
-        self._task.cancel()  # cancel sin await — task zombie garantizado
-```
-
-Después:
-```python
-async def stop(self) -> None:
-    if self._task:
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-```
-
-Call sites actualizados a `await _monitor.stop()` en shutdown.
-
----
-
-### Problema B — Locomotion Freshness inexistente
-
-**Fix 3 — ALTO: Vaciar cmd_queue entre reconnects**
-
-La queue se crea una sola vez y sobrevive los reconnects. Comandos del ciclo anterior
-causaban locomotion residual inmediata al reconectar.
-
-```python
-# Antes de crear pub_task en cada ciclo de reconnect:
-while not cmd_queue.empty():
-    try:
-        cmd_queue.get_nowait()
-    except asyncio.QueueEmpty:
-        break
-log("RECONNECT", "cmd_queue vaciada")
-```
-
----
-
-### Pending — Fix 6 (bloqueado hasta validación runtime)
-
-Freshness watchdog en `publish_loop` — independiente del cliente.
-`last_cmd` actualmente se republica indefinidamente si el cliente muere.
-Fix 6 NO se aplica hasta que Fix 1 esté validado con el robot en runtime.
-
----
-
-## Interacción entre problemas (documentada)
+## 10. Estructura del repositorio
 
 ```
-reconnect sucio (Problema A)
-    → comandos stale en queue (Problema B)
-    → locomotion residual post-reconnect
-    → complica siguiente reconnect
-    → degradación progresiva observable
+scripts/
+  go2_master.py              Proceso maestro (conexión WebRTC única)
+  teleop_client.py           Cliente de teleoperación
+  yolo_viewer.py             Detección YOLO (venv aislado)
+  frame_ipc.py               IPC de video master -> YOLO
+  go2_run.sh                 Lanzador Test 1 (cámara + YOLO)
+  go2_launch.sh              Lanzador Test 2 (SLAM 2D)
+  go2_launch_voxel3d.sh      Lanzador Test 3 (voxel 3D)
+  lidar_ros_publisher.py     UDP 5005 -> LaserScan (Docker)
+  odom_ros_publisher.py      UDP 5006 -> /odom + TF (Docker)
+  cloud_ros_publisher.py     UDP 5007 -> PointCloud2 /cloud (Docker)
+  slam_params.yaml           Parámetros de slam_toolbox
+  rviz_go2.rviz              Vista RViz para SLAM 2D
+  rviz_voxel3d.rviz          Vista RViz para nube 3D
+  patch_skip_decode.py       Mitigación del decode (1 de cada N)
+  patch_cloud3d.py           Salida de nube 3D (aditivo)
+  diag_slam_*.py             Diagnósticos del SLAM interno (archivados)
+tests/
+  test1_camara_yolo/         Lanzador + README del Test 1
+  test2_slam2d/              Lanzador + README del Test 2
+  test3_voxel3d/             Lanzador + config RViz + README del Test 3
 ```
-
----
-
-## Validated Runtime (Fase 1)
-
-| Criterio                    | Resultado              |
-|-----------------------------|------------------------|
-| Single WebRTC session       | ✅ Confirmado — LocalAP |
-| /scan publishing            | ✅ ~6-8 Hz estable      |
-| /odom publishing            | ✅ ~17-22 Hz estable    |
-| TF odom→base_link           | ✅ Confirmado           |
-| RViz visualization          | ✅ Confirmado visual    |
-| Teleop IPC                  | ✅ Funcional            |
-| Robot locomotion WASD       | ✅ Operacional          |
-| Auto-reconnect              | ✅ 15s delay            |
-| Asyncio lifecycle fixes     | 🔄 Aplicados — pendiente validación runtime con robot |
-
----
-
-## Stack
-
-| Component           | Technology                       |
-|---------------------|----------------------------------|
-| Robot SDK           | unitree_webrtc_connect (LocalAP) |
-| ROS2                | Humble — Docker osrf/ros:humble  |
-| Host Python         | 3.10 + go2_legacy_env            |
-| LiDAR transport     | UDP 127.0.0.1:5005               |
-| Odometry transport  | UDP 127.0.0.1:5006               |
-| Teleop IPC          | Unix Socket /tmp/go2_master.sock |
-| Visualization       | RViz2 (Docker)                   |
-
----
-
-## Firmware Quirks — Go2 Pro
-
-| Quirk                        | Observación                                        |
-|------------------------------|----------------------------------------------------|
-| data2=3                      | AES key mandatory — firmware 1.1.x diverge del README oficial |
-| BalanceStand requerido       | Sin él el robot mueve torso pero no levanta patas  |
-| WebRTC session drops ~50-60s | Comportamiento confirmado — también en scripts históricos |
-| ICE sensible a multi-homing  | Sin filtro 192.168.12.* todos los candidate pairs fallan |
-| LocalAP requerido            | LocalSTA falla — robot no expone IP en ese modo    |
-| pynput listener timing       | Iniciar DESPUÉS de conn.connect() — antes bloquea ICE |
-| Move es setpoint continuo    | No es comando discreto — requiere loop 20Hz        |
-| CycloneDDS/Ethernet          | No confirmado en Pro — funciona en EDU con Jetson interno |
-
----
-
-## Architectural Decisions (ADRs)
-
-**ADR-001 — Filtro ICE como monkey patch local**  
-Filtrar candidatos ICE en cada script individualmente. No contaminar la librería instalada.
-
-**ADR-002 — pynput sobre cv2.waitKey**  
-cv2.waitKey no detecta key release real. Sin key release el robot no para al soltar tecla.
-
-**ADR-003 — Estado continuo 20Hz sobre modelo pulse**  
-Move es velocity setpoint continuo. Pulse model producía comportamiento errático confirmado.
-
-**ADR-004 — listener.start() después de conn.connect()**  
-Evidencia experimental directa — listener antes de connect bloqueaba ICE negotiation.
-
-**ADR-005 — AES key como variable de entorno**  
-Repo público — no exponer credenciales de dispositivo.
-
-**ADR-006 — Single WebRTC session como master bridge**  
-Go2 Pro acepta máximo 2 conexiones WebRTC. Arquitectura bridge evita conflictos de slots.
-
-**ADR-007 — Docker naming fijo --name go2_ros2**  
-`$(docker ps -q)` es frágil con múltiples containers. Nombre fijo elimina ambigüedad.
-
----
-
-## Repository Structure
-
-```
-scripts/    — runtime principal
-              go2_master.py        WebRTC bridge maestro
-              teleop_client.py     Teleop IPC pynput
-              lidar_ros_publisher.py  UDP 5005 → /scan
-              odom_ros_publisher.py   UDP 5006 → /odom + TF
-              lidar_sender.py      Legacy — referencia histórica
-              odom_sender.py       Legacy — referencia histórica
-
-audits/     — herramientas de diagnóstico
-              lidar_audit.py       Inspección de topics LiDAR
-              lidar_inspect.py     Análisis de payload voxel
-              pose_audit.py        Auditoría de odometría
-
-docs/       — referencia histórica
-```
-
----
-
-## Project Status
-
-| Área                   | Estado                                              |
-|------------------------|-----------------------------------------------------|
-| WebRTC base            | ✅ Estable                                          |
-| ROS2 bridge            | ✅ Estable                                          |
-| LiDAR pipeline         | ✅ Estable (~6-8 Hz — límite firmware)              |
-| Odometry pipeline      | ✅ Estable (~17-22 Hz)                              |
-| TF tree                | ✅ Estable                                          |
-| Teleop IPC             | ✅ Funcional                                        |
-| Asyncio lifecycle      | 🔄 Fix 1/2/3 aplicados — pendiente validación robot |
-| Freshness watchdog     | ⏳ Fix 6 pendiente validación lifecycle             |
-| Launch orchestration   | ⏳ Post runtime stabilization                       |
-| Jetson edge node       | 🔭 Roadmap futuro                                  |
-| Zenoh remote bridge    | 🔭 Roadmap futuro                                  |
-| SLAM / Nav2            | 🔭 Roadmap futuro                                  |
-
----
-
-## Roadmap
-
-| Etapa | Descripción | Estado |
-|-------|-------------|--------|
-| 1 | Pipeline sensorial base — LiDAR + ODOM | ✅ Completada |
-| 2 | Integración ROS2 + RViz | ✅ Completada |
-| 3 | Arquitectura teleoperación IPC | ✅ Completada |
-| 4 | Auditoría runtime asyncio/WebRTC | ✅ Completada |
-| 5 | Runtime stabilization — fixes lifecycle + freshness | 🔄 En progreso |
-| 6 | Teleop operacional estable — sesiones largas sin degradación | ⏳ Pendiente |
-| 7 | Integración navegación ROS2 — cmd_vel bridge, Nav2, SLAM | ⏳ Futuro |
-| 8 | Plataforma experimental avanzada — Jetson edge, Zenoh, Isaac | ⏳ Futuro |
-
----
-
-*Unitree Go2 Pro — Deterministic Runtime Engineering*  
-*ROS2 Humble + WebRTC + asyncio*  
-*Single-Session WebRTC Bridge for Real-Time ROS2 Teleoperation and Sensor Fusion on Quadruped Robots*
