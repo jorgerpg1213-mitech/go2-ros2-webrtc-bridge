@@ -50,13 +50,23 @@ _aioice_ice.get_host_addresses = lambda use_ipv4, use_ipv6: [
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
 # Switch de diagnostico. True = reactiva LiDAR/ODOM (necesario para SLAM/RViz).
-# False = no se suscribe a sensores; aisla la locomocion para descartar que el
-# procesamiento de LiDAR este ahogando el event loop. Flipear a True restaura todo.
-ENABLE_SENSORS = True
+# ODOM se suscribe SIEMPRE: es baratisimo (~0.1ms) y mantiene el data channel
+# WebRTC activo para que el VIDEO no se degrade. El LiDAR (nube voxel pesada) es
+# lo unico opcional, porque es lo que satura el WiFi al alejarse.
+#   ENABLE_LIDAR=0 ./go2_launch.sh  -> solo ODOM+camara+teleop (test de alcance).
+ENABLE_LIDAR = os.environ.get("ENABLE_LIDAR", "0") != "0"
+# ENABLE_ODOM=0 quita tambien la suscripcion a ODOM -> el master queda IDENTICO al
+# baseline teleop_video2 (puro video + comandos, sin streams por el canal confiable).
+# Para el test de maximo alcance: ENABLE_LIDAR=0 ENABLE_ODOM=0 ./go2_launch.sh
+ENABLE_ODOM  = os.environ.get("ENABLE_ODOM", "0") != "0"
+# CLOUD3D PATCH: salida de nube 3D al puerto 5007 (cloud_ros_publisher).
+# Default off => no afecta los tests de camara/2D.
+ENABLE_CLOUD3D = os.environ.get("ENABLE_CLOUD3D", "0") != "0"
+ENABLE_SENSORS = True  # compat interno
 
 # Camara: True muestra el streaming en una ventana (como teleop_video2.py).
 # El stream se consume siempre (keepalive); este switch solo controla la ventana.
-ENABLE_CAMERA = True
+ENABLE_CAMERA = os.environ.get("ENABLE_CAMERA", "1") != "0"
 
 # Export de frames al proceso de YOLO via memoria compartida.
 # False = master se comporta identico al auditado (esta ruta no se ejecuta).
@@ -72,6 +82,9 @@ LIDAR_UDP_HOST = "127.0.0.1"
 LIDAR_UDP_PORT = 5005
 ODOM_UDP_HOST  = "127.0.0.1"
 ODOM_UDP_PORT  = 5006
+CLOUD_UDP_HOST = "127.0.0.1"   # CLOUD3D PATCH
+CLOUD_UDP_PORT = 5007          # CLOUD3D PATCH
+CLOUD_MAX_PTS  = 5000          # CLOUD3D PATCH: cap para UDP (<64KB) y carga ligera
 
 IPC_SOCKET_PATH = "/tmp/go2_master.sock"
 
@@ -212,6 +225,7 @@ def set_lifecycle(new_state: LifecycleState, reason: str = "") -> None:
 
 _udp_lidar = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _udp_odom  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_udp_cloud = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # CLOUD3D PATCH
 
 def udp_send(sock: socket.socket, data: bytes, host: str, port: int, label: str) -> None:
     try:
@@ -251,8 +265,37 @@ def lidar_callback(message: dict) -> None:
     _lidar_pts_sum += pts.shape[0]
     _lidar_scans += 1
 
+    # Puntos en COORDENADAS DEL MUNDO (odom): xyz = origin global + indice*resolucion.
     xyz    = origin + pts_2d * _LIDAR_RESOLUTION
-    x, y   = xyz[:, 0], xyz[:, 1]
+    # CLOUD3D PATCH: mandar puntos 3D (mundo) al publisher de nube, con downsample.
+    if ENABLE_CLOUD3D:
+        _pts3d = xyz
+        if _pts3d.shape[0] > CLOUD_MAX_PTS:
+            _stride = _pts3d.shape[0] // CLOUD_MAX_PTS + 1
+            _pts3d = _pts3d[::_stride]
+        _ncloud = int(_pts3d.shape[0])
+        _cloud_payload = struct.pack("<II", state.scan_seq, _ncloud) + \
+            _pts3d.astype(np.float32).tobytes()
+        udp_send(_udp_cloud, _cloud_payload, CLOUD_UDP_HOST, CLOUD_UDP_PORT, "cloud")
+
+    # --- FIX semantica de coordenadas (mundo -> local del robot) ---
+    # Antes se calculaba angle/range desde el origen del mundo (0,0) y se publicaba
+    # como LaserScan en frame 'laser' (relativo al robot) -> RViz volvia a aplicar la
+    # TF odom->base_link -> doble desplazamiento -> la pared "se iba" con el robot.
+    # LaserScan es intrinsecamente relativo al sensor, asi que hay que expresar los
+    # puntos en el frame del robot ANTES de sacar angulo/distancia: restar la posicion
+    # del robot (traslacion) y rotar por la inversa del yaw (orientacion).
+    # PoseState default = identidad (qw=1, x=y=0): si aun no llega odom, yaw=0 y
+    # posicion=0 -> local == mundo -> comportamiento previo (fallback documentado).
+    _p   = state.last_pose                      # snapshot (un solo hilo: event loop)
+    _rx, _ry = _p.x, _p.y
+    _yaw = math.atan2(2.0 * (_p.qw * _p.qz + _p.qx * _p.qy),
+                      1.0 - 2.0 * (_p.qy * _p.qy + _p.qz * _p.qz))
+    _c, _s = math.cos(_yaw), math.sin(_yaw)
+    _dx = xyz[:, 0] - _rx
+    _dy = xyz[:, 1] - _ry
+    x   =  _c * _dx + _s * _dy                  # rotacion inversa del yaw
+    y   = -_s * _dx + _c * _dy
     angles = np.arctan2(y, x)
     ranges = np.sqrt(x**2 + y**2)
 
@@ -444,8 +487,6 @@ class ConnectionMonitor:
             self.tick()
 
     def tick(self) -> None:
-        if not ENABLE_SENSORS:
-            return  # sin sensores no hay nada que monitorear
         now = time.monotonic()
 
         scan_delta = state.scan_seq - self._prev_scan_seq
@@ -453,19 +494,24 @@ class ConnectionMonitor:
         self._prev_scan_seq = state.scan_seq
         self._prev_odom_seq = state.odom_seq
 
+        if ENABLE_ODOM:
+            odom_elapsed  = now - state.last_odom_ts if state.last_odom_ts else float("inf")
+            odom_timeout  = odom_elapsed  > ODOM_TIMEOUT_S
+            state.odom_ok = not odom_timeout
+            if odom_timeout:
+                log("MONITOR", f"odom_timeout   elapsed={odom_elapsed:.1f}s")
+        else:
+            state.odom_ok = True   # no aplica; odom apagado
+
+        if not ENABLE_LIDAR:
+            state.lidar_ok = True   # no aplica; no monitorear el LiDAR apagado
+            return
+
         lidar_elapsed = now - state.last_scan_ts if state.last_scan_ts else float("inf")
-        odom_elapsed  = now - state.last_odom_ts if state.last_odom_ts else float("inf")
-
         lidar_timeout = lidar_elapsed > LIDAR_TIMEOUT_S
-        odom_timeout  = odom_elapsed  > ODOM_TIMEOUT_S
-
         state.lidar_ok = not lidar_timeout
-        state.odom_ok  = not odom_timeout
-
         if lidar_timeout:
             log("MONITOR", f"lidar_timeout  elapsed={lidar_elapsed:.1f}s")
-        if odom_timeout:
-            log("MONITOR", f"odom_timeout   elapsed={odom_elapsed:.1f}s")
 
         # Logs periodicos LIDAR/ODOM silenciados para prueba de locomocion
         # if scan_delta > 0:
@@ -731,8 +777,8 @@ async def main() -> None:
     # Observabilidad: heartbeat de estado (la camara corre en el hilo main)
     asyncio.create_task(status_loop())
     _cam_state = "ON" if (ENABLE_CAMERA and _CV2_AVAILABLE) else "OFF"
-    _sen_state = "ON" if ENABLE_SENSORS else "OFF"
-    log("INIT", "camara=" + _cam_state + "  sensores=" + _sen_state)
+    log("INIT", f"camara={_cam_state}  lidar={'ON' if ENABLE_LIDAR else 'OFF'}  "
+                f"odom={'ON' if ENABLE_ODOM else 'OFF'}")
 
     while not _shutdown_event.is_set():
         set_lifecycle(LifecycleState.CONNECTING)
@@ -749,12 +795,13 @@ async def main() -> None:
             continue
 
         set_lifecycle(LifecycleState.CONNECTED)
-        if ENABLE_SENSORS:
+        if ENABLE_ODOM:
+            conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ROBOTODOM"], odom_callback)
+        if ENABLE_LIDAR:
             conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ULIDAR_ARRAY"], lidar_callback)
-            conn.datachannel.pub_sub.subscribe(RTC_TOPIC["ROBOTODOM"],    odom_callback)
-            log("INIT", "subscribed  topics=[ULIDAR_ARRAY, ROBOTODOM]")
-        else:
-            log("INIT", "SENSORS OFF (ENABLE_SENSORS=False) — sin LiDAR/ODOM, modo diagnostico")
+        log("INIT", f"subscribed  lidar={'ON' if ENABLE_LIDAR else 'OFF'}  "
+                    f"odom={'ON' if ENABLE_ODOM else 'OFF'}  "
+                    f"(sin subs = baseline teleop_video2)")
         # Video / Camara — el baseline teleop_video2.py mantiene la sesion viva
         # consumiendo el stream RTP. Sin esto la sesion WebRTC se cierra sola.
         try:
