@@ -158,6 +158,7 @@ evidencia, sin uso operativo.
 | 1 | Cámara + YOLO + teleop | `scripts/go2_run.sh` | `tests/test1_camara_yolo/` |
 | 2 | SLAM 2D + teleop | `scripts/go2_launch.sh` | `tests/test2_slam2d/` |
 | 3 | Voxel 3D + teleop | `scripts/go2_launch_voxel3d.sh` | `tests/test3_voxel3d/` |
+| 4 | Audio bidireccional + YOLO + teleop | `tests/test4_audio_bidir/go2_run_audio.sh` | `tests/test4_audio_bidir/` |
 
 Cada carpeta `tests/` tiene su propio README con comandos exactos. Resumen también en
 `pruebas_go2.docx`.
@@ -226,4 +227,5 @@ tests/
   test1_camara_yolo/         Lanzador + README del Test 1
   test2_slam2d/              Lanzador + README del Test 2
   test3_voxel3d/             Lanzador + config RViz + README del Test 3
+  test4_audio_bidir/         Lanzador + README del Test 4 (audio bidireccional)
 ```
